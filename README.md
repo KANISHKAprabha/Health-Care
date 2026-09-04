@@ -2,16 +2,75 @@
 
 A Django + Django REST Framework backend for managing Patients, Doctors, and
 Patient–Doctor assignments, with JWT authentication and per-user ownership of
-patient records. Built per the decisions recorded in `ARCHITECTURE.MD` — this
-file is the practical "how to run it" companion; `ARCHITECTURE.MD` is the
-detailed rationale.
+patient records.
 
 ## Tech Stack
 
-- Python 3.13, Django, Django REST Framework
-- `djangorestframework-simplejwt` — JWT auth
+- Python, Django 6.1.1, Django REST Framework 3.18.0
+- `djangorestframework-simplejwt` 5.5.1 — JWT auth
 - PostgreSQL (`psycopg2-binary`)
 - `django-environ` — `.env`-based configuration
+- `pytest` + `pytest-django` — automated tests
+
+## Project Structure
+
+```
+config/          Django project: settings, root urls, custom DRF exception handler
+accounts/        Identity app — custom User model, register/login
+  models.py          Custom User (AbstractBaseUser + PermissionsMixin, email login)
+  serializers.py      Register/Login input validation
+  services.py          AuthService — issues JWT pairs
+  repositories.py     UserRepository — pure data access
+  views.py / urls.py  RegisterView, LoginView
+api/             Domain app — Patient, Doctor, PatientDoctorMapping
+  models.py               Patient, Doctor, PatientDoctorMapping
+  serializers.py           Patient/Doctor/Mapping (de)serialization
+  services/                business rules, raise domain exceptions
+  repositories/            pure data access (return instance or None, never raise)
+  views.py / urls.py       APIView subclasses, one per resource
+  exceptions.py            DomainError subclasses (uniform error shape)
+  permissions.py           IsOwner (defined, currently unused — see below)
+  responses.py             success_response() envelope helper
+tests/           pytest test suite (auth, patient, doctor, mapping views)
+manage.py, pytest.ini, requirements.txt
+```
+
+## Architecture
+
+- **Two apps, not four.** `accounts` (identity) and `api` (Patient/Doctor/
+  Mapping — one bounded context) — splitting the domain further would just
+  add cross-app imports without reducing coupling.
+- **Custom `User` model** (`AbstractBaseUser` + `PermissionsMixin`, `email`
+  as `USERNAME_FIELD`) instead of `AbstractUser`, since the required fields
+  (name/email/password) don't match Django's default user fields.
+- **Layered architecture**: view → service → repository → model.
+  Repositories are pure data access (return a model instance or `None`,
+  never raise); services hold business rules and raise domain exceptions;
+  views stay thin (deserialize → call service → wrap in `success_response`).
+- **Explicit `APIView` subclasses**, not `ModelViewSet` — keeps the
+  view→service call explicit instead of hidden behind generated CRUD.
+- **Custom domain exceptions + one exception handler** (`DomainError`
+  subclasses in `api/exceptions.py`, wired via `EXCEPTION_HANDLER` in
+  settings) produce a single uniform response envelope for every error,
+  instead of DRF's default per-exception shapes.
+- **Ownership**: `Patient.created_by` is the ownership boundary.
+  `PatientService.get_patient(patient_id, user)` raises `PatientNotFoundError`
+  (404) if the patient doesn't exist and `NotOwnerError` (403) if it exists
+  but isn't the requester's — enforced in the service layer on every
+  GET/PUT/DELETE, not just read. `Doctor` has no owner by design (any
+  authenticated user can read/update/delete any doctor). `api/permissions.py`
+  defines an `IsOwner` DRF permission class, but ownership enforcement lives
+  in `PatientService` instead so error messages stay consistent with every
+  other domain rule; `IsOwner` is currently unused by any view.
+- **Defense-in-depth on duplicate mappings**: `MappingService.assign_doctor`
+  first checks `MappingRepository.exists()` for a clean error message on the
+  normal path, then relies on the DB's `unique_together` constraint as the
+  final authority against the check-then-act race, catching `IntegrityError`
+  and re-raising it as the same `DuplicateMappingError`. Duplicate-email
+  registration relies on the DB's `unique` constraint alone — no pre-insert
+  check — since it's a rare, one-shot action.
+- **No HTML/templates** — this is an API-only backend; DRF's browsable API
+  is the only "UI."
 
 ## Prerequisites
 
@@ -31,8 +90,8 @@ venv\Scripts\activate           # Windows
 pip install -r requirements.txt
 
 # 3. Configure environment
-cp .env.example .env
-# then edit .env with your own SECRET_KEY and Postgres credentials
+# Create a .env file in the project root (see Environment variables below) —
+# there is no .env.example checked in, so create it from scratch.
 
 # 4. Apply migrations
 python manage.py migrate
@@ -50,17 +109,19 @@ The API is now available at `http://127.0.0.1:8000/`.
 
 | Variable | Purpose | Example |
 |---|---|---|
-| `SECRET_KEY` | Django secret key | (generate a random one — never reuse the example) |
+| `SECRET_KEY` | Django secret key | (generate a random one) |
 | `DEBUG` | Django debug mode | `True` for local dev |
+| `ALLOWED_HOSTS` | Comma-separated allowed hosts (optional; defaults to `*` when `DEBUG=True`, empty otherwise) | `localhost,127.0.0.1` |
 | `DB_NAME` | Postgres database name | `healthcare` |
 | `DB_USER` | Postgres user | `postgres` |
 | `DB_PASSWORD` | Postgres password | — |
-| `DB_HOST` | Postgres host | `localhost` |
-| `DB_PORT` | Postgres port | `5432` |
-| `JWT_ACCESS_TOKEN_LIFETIME_MINUTES` | Access token lifetime | `60` |
-| `JWT_REFRESH_TOKEN_LIFETIME_DAYS` | Refresh token lifetime | `7` |
+| `DB_HOST` | Postgres host (optional, default `localhost`) | `localhost` |
+| `DB_PORT` | Postgres port (optional, default `5432`) | `5432` |
+| `JWT_ACCESS_TOKEN_LIFETIME_MINUTES` | Access token lifetime (optional, default `60`) | `60` |
+| `JWT_REFRESH_TOKEN_LIFETIME_DAYS` | Refresh token lifetime (optional, default `7`) | `7` |
 
-See `.env.example` for a template.
+`SECRET_KEY`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD` are required — the app
+will fail to start without them.
 
 ## Response Envelope
 
@@ -70,7 +131,7 @@ Every response is wrapped uniformly:
 // success
 {"data": { ... }}
 
-// domain error (not found, not owner, duplicate, etc.)
+// domain error (not found, not owner, duplicate, invalid credentials, etc.)
 {"error": {"message": "Patient not found.", "status_code": 404}}
 
 // validation error
@@ -82,9 +143,10 @@ Every response is wrapped uniformly:
 1. **Register** — creates the user and returns a token pair immediately.
 2. **Login** — returns a token pair for an existing user.
 3. Send `Authorization: Bearer <access_token>` on every request below (all
-   endpoints except `register`/`login`/`token/refresh` require it).
+   endpoints except `register`/`login`/`token/refresh` require it — enforced
+   by the project-wide default `IsAuthenticated` permission).
 4. When the access token expires, `POST /api/token/refresh/` with the
-   refresh token to get a new access token.
+   refresh token to get a new access token (refresh tokens rotate on use).
 
 ```http
 POST /api/auth/register/
@@ -106,13 +168,21 @@ Content-Type: application/json
 {"data": {"refresh": "<refresh_token>", "access": "<access_token>"}}
 ```
 
+Invalid credentials return `401` with `{"error": {"message": "Invalid email or password.", "status_code": 401}}`.
+
 ## API Reference
 
-One sample request/response per resource. Full endpoint list, request bodies
-and a runnable end-to-end flow are in `Healthcare-API.postman_collection.json`
-(import into Postman — see below).
+All endpoints below require `Authorization: Bearer <access_token>` unless noted.
 
 ### Patients (owned per-user)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/patients/` | List patients created by the current user |
+| `POST` | `/api/patients/` | Create a patient (owned by the current user) |
+| `GET` | `/api/patients/<id>/` | Retrieve one patient |
+| `PUT` | `/api/patients/<id>/` | Update one patient |
+| `DELETE` | `/api/patients/<id>/` | Delete one patient |
 
 ```http
 POST /api/patients/
@@ -139,9 +209,17 @@ Content-Type: application/json
 
 `GET/PUT/DELETE /api/patients/<id>/` only succeed for the patient's own
 creator — any other authenticated user gets `403` (`NotOwnerError`); a
-non-existent id gets `404`.
+non-existent id gets `404` (`PatientNotFoundError`).
 
 ### Doctors (shared, not owned)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/doctors/` | List all doctors |
+| `POST` | `/api/doctors/` | Create a doctor |
+| `GET` | `/api/doctors/<id>/` | Retrieve one doctor |
+| `PUT` | `/api/doctors/<id>/` | Update one doctor |
+| `DELETE` | `/api/doctors/<id>/` | Delete one doctor |
 
 ```http
 POST /api/doctors/
@@ -168,7 +246,14 @@ Content-Type: application/json
 Any authenticated user can read/update/delete any doctor — doctors are a
 shared resource, not per-user.
 
-### Mappings
+### Mappings (Patient ↔ Doctor assignments)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/mappings/` | List all mappings for the current user's patients |
+| `POST` | `/api/mappings/` | Assign a doctor to a patient |
+| `GET` | `/api/mappings/<patient_id>/` | List doctors assigned to that patient |
+| `DELETE` | `/api/mappings/<mapping_id>/` | Remove one mapping by its own id |
 
 ```http
 POST /api/mappings/
@@ -188,10 +273,12 @@ Content-Type: application/json
 }
 ```
 
-`GET /api/mappings/<patient_id>/` returns the doctors assigned to that
-patient; `DELETE /api/mappings/<id>/` removes one mapping by its own id.
-Assigning the same doctor to the same patient twice returns `400`
-(`DuplicateMappingError`).
+The patient in `POST /api/mappings/` must belong to the requesting user
+(`404` `PatientNotFoundError` otherwise); the doctor must exist (`404`
+`DoctorNotFoundError` otherwise). Assigning the same doctor to the same
+patient twice returns `400` (`DuplicateMappingError`). Note the dual meaning
+of `<id>` on `/api/mappings/<id>/`: `GET` treats it as a `patient_id`,
+`DELETE` treats it as a `mapping_id`.
 
 ## Validation Rules
 
@@ -200,66 +287,31 @@ Assigning the same doctor to the same patient twice returns `400`
 - `contact_number` (Patient and Doctor): digits only, optional leading `+`, 7–15 digits
 - `Doctor.email`: unique
 - `User.email`: unique (registration)
+- `password` (registration): minimum 8 characters
 
-## Testing with Postman
+## Testing with pytest
 
-Import `Healthcare-API.postman_collection.json`. It's organized into `Auth`,
-`Patients`, `Doctors`, `Mappings` folders. Run **Login** first (or
-**Register** then **Login**) — a post-response script auto-captures
-`{{access_token}}`/`{{refresh_token}}` into collection variables, which every
-other request uses automatically via collection-level Bearer auth.
-`Create Patient`/`Create Doctor`/`Assign Doctor to Patient` likewise
-auto-capture `{{patient_id}}`/`{{doctor_id}}`/`{{mapping_id}}` for the
-requests that need them.
+Automated tests use `pytest` + `pytest-django` (see `pytest.ini`, which sets
+`DJANGO_SETTINGS_MODULE=config.settings` and picks up `test_*.py` files).
+Tests live in `tests/`: `test_auth_views.py`, `test_patient_views.py`,
+`test_doctor_views.py`, `test_mapping_views.py`. (`accounts/tests.py` and
+`api/tests.py` are unused Django-default stubs.)
 
-If you use "Run Collection" top-to-bottom, run the `Mappings` folder before
-the `Delete Patient`/`Delete Doctor` requests — deleting a patient or doctor
-cascades and removes its mappings.
+```bash
+# run the full suite
+pytest
 
-## Architecture Summary
+# run a single file
+pytest tests/test_patient_views.py
 
-Full rationale in `ARCHITECTURE.MD`; the key decisions:
+# run a single test
+pytest tests/test_patient_views.py::test_create_patient_success
 
-- **Two apps, not four.** `accounts` (identity) and `api` (Patient/Doctor/
-  Mapping — one bounded context) — splitting the domain further would just
-  add cross-app imports without reducing coupling.
-- **Custom `User` model** (`AbstractBaseUser` + `PermissionsMixin`,
-  `email` as `USERNAME_FIELD`) instead of `AbstractUser`, since the spec's
-  fields (name/email/password) don't match Django's default user fields.
-- **Layered architecture**: view → service → repository → model.
-  Repositories are pure data access (return a model instance or `None`,
-  never raise); services hold business rules and raise domain exceptions;
-  views stay thin (deserialize → call service → wrap in `success_response`).
-- **Explicit `APIView` subclasses**, not `ModelViewSet` — keeps the
-  view→service call explicit instead of hidden behind generated CRUD.
-- **Custom domain exceptions + one exception handler** (`DomainError`
-  subclasses in `api/exceptions.py`, wired via `EXCEPTION_HANDLER` in
-  settings) produce a single uniform response envelope for every error,
-  instead of DRF's default per-exception shapes.
-- **Ownership**: `Patient.created_by` is the ownership boundary.
-  `PatientService.get_patient(patient_id, user)` raises `PatientNotFoundError`
-  (404) if the patient doesn't exist and `NotOwnerError` (403) if it exists
-  but isn't the requester's — enforced in the service layer on every
-  GET/PUT/DELETE, not just read. `Doctor` has no owner by design (spec:
-  "retrieve all doctors" with no per-user scoping).
-- **Defense-in-depth on duplicate mappings**: a service-level `exists()`
-  check handles the normal path (clean error message); the DB's
-  `unique_together` constraint is the final authority against the
-  check-then-act race, with its `IntegrityError` caught and re-raised as the
-  same domain error. Duplicate-email registration relies on the DB
-  constraint alone — an accepted, lower-priority gap for a rare, one-shot
-  action (see `ARCHITECTURE.MD` §9 for the full reasoning).
-- **No HTML/templates** — the spec's only testing instruction is
-  Postman/an API client, so DRF's browsable API is the only "UI."
+# verbose output
+pytest -v
+```
 
-### Known deviations from `ARCHITECTURE.MD`'s literal text
-
-- §10 describes a single `DATABASE_URL` parsed via `env.db()`; this project
-  uses discrete `DB_NAME`/`DB_USER`/`DB_PASSWORD`/`DB_HOST`/`DB_PORT`
-  variables instead, assembled directly into `DATABASES`. Functionally
-  equivalent.
-- §5 describes an `IsOwner` DRF permission class "applied on Patient
-  detail/update/delete views." That class still exists in
-  `api/permissions.py`, but ownership enforcement was moved into
-  `PatientService` (see above) to keep error messages consistent with every
-  other domain rule in the codebase; `IsOwner` is currently unused.
+The suite runs against the database configured in `.env` (via
+`pytest-django`, which creates and tears down a test database per run) —
+make sure your Postgres credentials in `.env` have permission to create
+databases.
