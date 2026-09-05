@@ -90,9 +90,7 @@ class MappingListCreateView(APIView):
 
 
 class MappingDetailView(APIView):
-    """GET treats `id` as a patient_id (doctors for that patient);
-    DELETE treats `id` as a mapping_id — matching the spec's shared
-    /api/mappings/<id>/ shape for these two actions."""
+  
 
     def get(self, request, id):
         mappings = MappingService.list_doctors_for_patient(id, request.user)

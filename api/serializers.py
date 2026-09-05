@@ -18,16 +18,13 @@ class DoctorSerializer(serializers.ModelSerializer):
 
 
 class MappingSerializer(serializers.Serializer):
-    """Write serializer — accepts patient/doctor as IDs. Existence and
-    ownership are validated in the service layer so failures come back as
-    the uniform domain-error envelope rather than a raw DRF PK error."""
-
+   
     patient = serializers.IntegerField()
     doctor = serializers.IntegerField()
 
 
 class MappingListSerializer(serializers.ModelSerializer):
-    """Read serializer for GET /api/mappings/ — full context per row."""
+    
 
     patient = PatientSerializer()
     doctor = DoctorSerializer()
@@ -38,8 +35,6 @@ class MappingListSerializer(serializers.ModelSerializer):
 
 
 class MappingReadSerializer(serializers.ModelSerializer):
-    """Read serializer for GET /api/mappings/<patient_id>/ — the point is
-    'which doctors', so only the doctor is nested."""
 
     doctor = DoctorSerializer()
 
